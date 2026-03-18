@@ -1,0 +1,371 @@
+<!--
+Front-end-only prototype: "Learn English Studio"
+- Single HTML file, no build required
+- Uses: React + ReactDOM + Babel (in-browser JSX), Tailwind CDN
+- Features implemented client-side:
+  • Write area (textarea) + Text-to-Speech (play) + Speech-to-Text (live dictation)
+  • Quick lessons / prompts / roleplays
+  • Flashcards with simple spaced-repetition scheduling (localStorage)
+  • Speaking practice: play target audio, record user, playback
+  • Mini "AI" assistant (local pattern-based) + optional OpenAI API key input (user-provided) for real calls (CORS may block when called from browser)
+  • Progress persistence in localStorage
+
+How to use:
+1. Save this file as learn-english-frontend.html
+2. Open in your browser (Chrome/Edge recommended)
+3. Use the UI: speak, write, record, practice. Data saved locally.
+
+Note: this is a prototype. If you want, I can split into React components, add better SR/ASR scoring, or connect to a server for real AI.
+-->
+
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Learn English Studio — Frontend Prototype</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body class="bg-slate-900 text-slate-100">
+    <div id="root" class="min-h-screen p-4"></div>
+
+    <script type="text/babel">
+      const { useState, useEffect, useRef } = React;
+
+      // --- Utilities ---
+      const uid = () => Math.random().toString(36).slice(2, 9);
+
+      // Default sample flashcards (short set; you can import more)
+      const SAMPLE_CARDS = [
+        { q: 'Hello', a: 'Olá / oi' },
+        { q: 'How are you?', a: 'Como você está?' },
+        { q: 'Thank you', a: 'Obrigado / obrigada' },
+        { q: 'I would like a coffee', a: 'Eu gostaria de um café' },
+        { q: 'Where is the bathroom?', a: 'Onde fica o banheiro?' },
+        { q: 'My name is...', a: 'Meu nome é...' },
+        { q: 'I am learning English', a: 'Estou aprendendo inglês' },
+        { q: 'Can you help me?', a: 'Você pode me ajudar?' },
+        { q: 'I like music', a: 'Eu gosto de música' },
+        { q: 'See you later', a: 'Até mais' },
+        { q: 'What time is it?', a: 'Que horas são?' },
+        { q: 'I need a doctor', a: 'Preciso de um médico' },
+        { q: 'Where are you from?', a: 'De onde você é?' },
+        { q: 'I don\'t understand', a: 'Eu não entendo' },
+        { q: 'Please speak slowly', a: 'Por favor fale devagar' },
+        { q: 'How much is this?', a: 'Quanto custa isso?' },
+        { q: 'I like to travel', a: 'Eu gosto de viajar' },
+        { q: 'Help!', a: 'Socorro!' },
+        { q: 'Good morning', a: 'Bom dia' },
+        { q: 'Good night', a: 'Boa noite' },
+      ];
+
+      // Spaced repetition simple model: next interval days based on grade
+      const nextInterval = (card, grade) => {
+        // grade: 0 again, 1 hard, 2 good
+        const now = Date.now();
+        if (!card.easiness) card.easiness = 2.5;
+        if (!card.reps) card.reps = 0;
+        if (grade === 0) {
+          card.reps = 0;
+          card.interval = 1;
+        } else {
+          card.reps += 1;
+          if (grade === 1) card.easiness = Math.max(1.3, card.easiness - 0.15);
+          if (grade === 2) card.easiness = Math.min(2.5, card.easiness + 0.1);
+          if (card.reps === 1) card.interval = 1;
+          else if (card.reps === 2) card.interval = 6;
+          else card.interval = Math.round(card.interval * card.easiness);
+        }
+        card.nextReview = now + card.interval * 24 * 3600 * 1000;
+        return card;
+      };
+
+      // --- Main App ---
+      function App() {
+        // Editor / TTS / STT
+        const [text, setText] = useState(localStorage.getItem('les_text') || 'Type or dictate here...');
+        const [speaking, setSpeaking] = useState(false);
+        const recognitionRef = useRef(null);
+        const [listening, setListening] = useState(false);
+
+        // Flashcards
+        const [cards, setCards] = useState(() => {
+          const raw = localStorage.getItem('les_cards');
+          if (raw) return JSON.parse(raw);
+          return SAMPLE_CARDS.map(c => ({ id: uid(), ...c, nextReview: Date.now(), reps:0, easiness:2.5, interval:0 }));
+        });
+        const [curCard, setCurCard] = useState(null);
+
+        // Recorder for speaking practice
+        const [recording, setRecording] = useState(false);
+        const [recordedUrl, setRecordedUrl] = useState(null);
+        const mediaRecorderRef = useRef(null);
+        const chunksRef = useRef([]);
+
+        // Mini AI assistant
+        const [aiKey, setAiKey] = useState('');
+        const [aiQuery, setAiQuery] = useState('Give a short correction for: "I goed to school yesterday"');
+        const [aiReply, setAiReply] = useState('');
+        const [aiLoading, setAiLoading] = useState(false);
+
+        useEffect(() => {
+          localStorage.setItem('les_text', text);
+        }, [text]);
+
+        useEffect(() => {
+          localStorage.setItem('les_cards', JSON.stringify(cards));
+        }, [cards]);
+
+        useEffect(() => {
+          // set initial card to review
+          pickNextCard();
+        }, []);
+
+        // --- TTS ---
+        const speakText = (txt) => {
+          if (!window.speechSynthesis) return alert('Seu navegador não suporta SpeechSynthesis.');
+          window.speechSynthesis.cancel();
+          const ut = new SpeechSynthesisUtterance(txt);
+          ut.lang = 'en-US';
+          setSpeaking(true);
+          ut.onend = () => setSpeaking(false);
+          window.speechSynthesis.speak(ut);
+        };
+
+        // --- STT ---
+        const startDictation = () => {
+          const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (!SpeechRecognition) return alert('Seu navegador não suporta SpeechRecognition. Use Chrome/Edge no desktop.');
+          const rec = new SpeechRecognition();
+          rec.lang = 'en-US';
+          rec.interimResults = true;
+          rec.onresult = (ev) => {
+            let final = '';
+            let interim = '';
+            for (let i = 0; i < ev.results.length; i++) {
+              const r = ev.results[i];
+              if (r.isFinal) final += r[0].transcript;
+              else interim += r[0].transcript;
+            }
+            setText(prev => (prev + ' ' + final + ' ' + interim).trim());
+          };
+          rec.onend = () => setListening(false);
+          rec.onerror = () => setListening(false);
+          recognitionRef.current = rec;
+          rec.start();
+          setListening(true);
+        };
+        const stopDictation = () => {
+          if (recognitionRef.current) recognitionRef.current.stop();
+          setListening(false);
+        };
+
+        // --- Flashcards functions ---
+        const pickNextCard = () => {
+          const now = Date.now();
+          const due = cards.filter(c => !c.nextReview || c.nextReview <= now);
+          const next = due.length ? due[Math.floor(Math.random()*due.length)] : cards[Math.floor(Math.random()*cards.length)];
+          setCurCard(next);
+        };
+        const gradeCard = (cardId, grade) => {
+          setCards(prev => prev.map(c => c.id === cardId ? nextInterval({...c}, grade) : c));
+          // small delay then pick next
+          setTimeout(pickNextCard, 300);
+        };
+
+        // --- Recorder ---
+        const startRecording = async () => {
+          if (!navigator.mediaDevices) return alert('Microphone not available.');
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const mr = new MediaRecorder(stream);
+          mediaRecorderRef.current = mr;
+          chunksRef.current = [];
+          mr.ondataavailable = e => chunksRef.current.push(e.data);
+          mr.onstop = () => {
+            const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+            const url = URL.createObjectURL(blob);
+            setRecordedUrl(url);
+          };
+          mr.start();
+          setRecording(true);
+        };
+        const stopRecording = () => {
+          if (mediaRecorderRef.current) mediaRecorderRef.current.stop();
+          setRecording(false);
+        };
+
+        // --- Mini AI (local heuristics) ---
+        const localAi = (q) => {
+          // simple patterns: correction, roleplay, explain
+          const text = q.toLowerCase();
+          if (text.includes('correct') || text.includes('correction')) {
+            // naive: replace 'goed' -> 'went', 'I am' etc.
+            return q.replace('goed', 'went') + '\n\nTip: past of "go" is "went".';
+          }
+          if (text.includes('translate')) {
+            return 'I can translate short phrases. Paste: translate: <your phrase>'; 
+          }
+          if (text.includes('roleplay')) {
+            return 'Roleplay: Pretend I am a barista. Ask for coffee.\nYou: "Hi, can I have a medium latte, please?"';
+          }
+          // fallback: encourage practice
+          return "Nice! Try to make a 1-minute recording using these words: 'travel', 'learn', 'friend', 'city'. I'll give feedback based on clarity.";
+        };
+
+        const callAi = async () => {
+          setAiLoading(true);
+          setAiReply('');
+          try {
+            if (aiKey.trim()) {
+              // Try calling OpenAI (note: CORS may block when called from browser)
+              const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + aiKey },
+                body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role:'user', content: aiQuery }], max_tokens: 300 })
+              });
+              if (!resp.ok) throw new Error('OpenAI request failed: ' + resp.status);
+              const data = await resp.json();
+              const content = data.choices?.[0]?.message?.content || JSON.stringify(data);
+              setAiReply(content);
+            } else {
+              // local AI
+              const r = localAi(aiQuery);
+              setAiReply(r);
+            }
+          } catch (err) {
+            setAiReply('Erro: ' + err.message + '\n\nRodando local fallback...');
+            setAiReply(prev => prev + '\n\n' + localAi(aiQuery));
+          } finally {
+            setAiLoading(false);
+          }
+        };
+
+        // --- CSV import for cards ---
+        const importCsv = (csv) => {
+          const lines = csv.split('\n').map(l => l.trim()).filter(Boolean);
+          const newCards = lines.map(l => {
+            const parts = l.split(',');
+            return { id: uid(), q: parts[0].trim(), a: (parts[1]||'').trim(), nextReview: Date.now(), reps:0, easiness:2.5, interval:0 };
+          });
+          setCards(prev => [...newCards, ...prev]);
+        };
+
+        return (
+          <div className="max-w-6xl mx-auto">
+            <header className="flex items-center justify-between pb-4 mb-4 border-b border-slate-700">
+              <h1 className="text-2xl font-bold">Learn English Studio — Protótipo</h1>
+              <div className="text-sm text-slate-400">Frontend-only · grava local · experimente</div>
+            </header>
+
+            <main className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+
+              {/* Left: Writer + Dictation */}
+              <section className="lg:col-span-2 bg-slate-800 p-4 rounded-lg">
+                <h2 className="text-lg font-semibold mb-2">Write & Speak</h2>
+                <textarea className="w-full h-40 p-2 bg-slate-900 border border-slate-700 rounded" value={text} onChange={e=>setText(e.target.value)} />
+                <div className="flex gap-2 mt-2">
+                  <button onClick={()=>speakText(text)} className="px-3 py-2 bg-emerald-500 rounded">▶️ Play (TTS)</button>
+                  <button onClick={()=> { if(listening) stopDictation(); else startDictation(); }} className={`px-3 py-2 rounded ${listening ? 'bg-red-500' : 'bg-indigo-500'}`}>{listening ? '■ Stop dictation' : '🎙️ Dictate (STT)'}</button>
+                  <button onClick={()=> { setText(''); setRecordedUrl(null); }} className="px-3 py-2 bg-slate-600 rounded">Clear</button>
+                  <div className="ml-auto text-sm text-slate-400">{speaking ? 'Speaking...' : ''}</div>
+                </div>
+
+                <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="p-3 bg-slate-700 rounded">
+                    <h3 className="font-semibold">Speaking Practice</h3>
+                    <p className="text-sm text-slate-300">Play the sample, then record yourself and compare.</p>
+                    <div className="flex gap-2 mt-2">
+                      <button onClick={()=>speakText('Hello, my name is ')} className="px-2 py-1 bg-indigo-500 rounded">Play prompt</button>
+                      {!recording ? <button onClick={startRecording} className="px-2 py-1 bg-rose-500 rounded">Record</button> : <button onClick={stopRecording} className="px-2 py-1 bg-yellow-500 rounded">Stop</button>}
+                      {recordedUrl && <audio src={recordedUrl} controls className="ml-2" />}
+                    </div>
+                  </div>
+
+                  <div className="p-3 bg-slate-700 rounded">
+                    <h3 className="font-semibold">Mini Roleplay</h3>
+                    <p className="text-sm text-slate-300">Choose a situation and practice 60s dialogue.</p>
+                    <div className="flex gap-2 mt-2">
+                      <button onClick={()=> setText('You: Hi, can I have a medium latte please?\nBarista: Sure. Anything else?')} className="px-2 py-1 bg-emerald-500 rounded">Coffee</button>
+                      <button onClick={()=> setText('You: Hi, I\'d like to check in.\nReceptionist: Name?')} className="px-2 py-1 bg-emerald-500 rounded">Hotel</button>
+                      <button onClick={()=> setText('You: Excuse me, how do I get to the train station?')} className="px-2 py-1 bg-emerald-500 rounded">Directions</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 p-3 bg-slate-700 rounded">
+                  <h3 className="font-semibold">Lesson prompts / games</h3>
+                  <div className="flex gap-2 mt-2 flex-wrap">
+                    <button onClick={()=> setText('Describe your last weekend in 4 sentences.') } className="px-2 py-1 bg-sky-500 rounded">Describe weekend</button>
+                    <button onClick={()=> setText('List 10 things in your room in English.') } className="px-2 py-1 bg-sky-500 rounded">Word list</button>
+                    <button onClick={()=> setText('Write a 60-second story using: dog, rain, friend, bike.') } className="px-2 py-1 bg-sky-500 rounded">Story prompt</button>
+                  </div>
+                </div>
+
+              </section>
+
+              {/* Right column: Flashcards + AI */}
+              <aside className="bg-slate-800 p-4 rounded-lg">
+                <h2 className="text-lg font-semibold mb-2">Flashcards (Spaced Repetition)</h2>
+                <div className="mb-3">
+                  <div className="p-3 bg-slate-700 rounded">
+                    <div className="font-semibold">Current Card</div>
+                    {!curCard ? <div className="text-sm text-slate-400">Nenhum cartão disponível</div> : (
+                      <div className="mt-2">
+                        <div className="text-xl">{curCard.q}</div>
+                        <details className="mt-2 bg-slate-900 p-2 rounded"><summary className="cursor-pointer">Mostrar resposta</summary><div className="mt-2">{curCard.a}</div></details>
+                        <div className="flex gap-2 mt-3">
+                          <button onClick={()=>gradeCard(curCard.id, 0)} className="px-2 py-1 bg-red-600 rounded">Again</button>
+                          <button onClick={()=>gradeCard(curCard.id, 1)} className="px-2 py-1 bg-yellow-600 rounded">Hard</button>
+                          <button onClick={()=>gradeCard(curCard.id, 2)} className="px-2 py-1 bg-emerald-600 rounded">Good</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-3 p-3 bg-slate-700 rounded">
+                    <div className="flex items-center gap-2">
+                      <input id="csv" type="file" accept=".csv" onChange={(e)=>{
+                        const f = e.target.files[0]; if(!f) return; const reader = new FileReader(); reader.onload = ()=> importCsv(reader.result); reader.readAsText(f);
+                      }} className="text-sm" />
+                      <label className="text-sm text-slate-400">Import CSV: question,answer</label>
+                    </div>
+                    <div className="text-sm text-slate-400 mt-2">Cartões salvos: {cards.length}</div>
+                    <button onClick={()=>{ setCards(SAMPLE_CARDS.map(c=>({ id: uid(), ...c, nextReview: Date.now(), reps:0, easiness:2.5, interval:0 }))); pickNextCard(); }} className="mt-2 px-2 py-1 bg-indigo-600 rounded">Reset Sample Deck</button>
+                  </div>
+                </div>
+
+                <hr className="my-3 border-slate-700" />
+
+                <div className="p-3 bg-slate-700 rounded mb-3">
+                  <h3 className="font-semibold">Mini AI Assistant</h3>
+                  <p className="text-sm text-slate-300">Use local smart replies or paste OpenAI API key (optional).</p>
+                  <textarea value={aiQuery} onChange={e=>setAiQuery(e.target.value)} className="w-full h-20 bg-slate-900 p-2 mt-2 rounded" />
+                  <input placeholder="Paste OpenAI API key (optional)" value={aiKey} onChange={e=>setAiKey(e.target.value)} className="w-full mt-2 p-2 bg-slate-900 rounded text-sm" />
+                  <div className="flex gap-2 mt-2">
+                    <button onClick={callAi} className="px-2 py-1 bg-emerald-500 rounded">Ask AI</button>
+                    <button onClick={()=> { speakText(aiReply || 'No reply yet'); }} className="px-2 py-1 bg-indigo-500 rounded">Speak reply</button>
+                  </div>
+                  <pre className="mt-2 p-2 bg-slate-900 rounded text-sm whitespace-pre-wrap">{aiLoading ? 'Loading...' : aiReply}</pre>
+                </div>
+
+                <div className="p-3 bg-slate-700 rounded">
+                  <h3 className="font-semibold">Quick Progress</h3>
+                  <div className="text-sm mt-2">Cards due: {cards.filter(c => !c.nextReview || c.nextReview <= Date.now()).length}</div>
+                  <button onClick={()=>{ const due = cards.filter(c=> !c.nextReview || c.nextReview <= Date.now()).length; alert('You have ' + due + ' cards due.'); }} className="mt-2 px-2 py-1 bg-sky-500 rounded">Check due</button>
+                </div>
+
+              </aside>
+            </main>
+
+            <footer className="mt-6 text-sm text-slate-500">Dica: salve o arquivo e abra localmente. Se quiser, eu melhoro esse protótipo, adiciono análises de pronúncia e integração com OpenAI/servidor.</footer>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+    </script>
+  </body>
+</html>
